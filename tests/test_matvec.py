@@ -12,7 +12,11 @@ Useful environment variables:
 
     LLMVSFPGA_RANDOM=100   number of random 16x16 matrices (default 30)
     LLMVSFPGA_BIG=1        also run the full-size M_MAX x N_MAX test (slow)
+    LLMVSFPGA_LANES=16,4   LANES values to simulate (default "16,4")
+    LLMVSFPGA_WAVES=1      dump waveforms (FST) in sim/sim_build/lanes<N>/
     SIM=icarus             simulator passed to the cocotb runner (default icarus)
+
+The convenient front end is sim/run_sim.py (see its --help).
 
 Structure of this file:
   * cocotb testbench (functions named tb_*): executed inside the simulator.
@@ -28,6 +32,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
+
+import pytest
 
 import cocotb
 from cocotb.clock import Clock
@@ -51,6 +57,8 @@ ID_VALUE = 0x4C4C4650  # "LLFP"
 
 N_RANDOM = int(os.environ.get("LLMVSFPGA_RANDOM", "30"))
 RUN_BIG = os.environ.get("LLMVSFPGA_BIG", "0") == "1"
+WAVES = os.environ.get("LLMVSFPGA_WAVES", "0") == "1"
+LANES_LIST = [int(v) for v in os.environ.get("LLMVSFPGA_LANES", "16,4").split(",") if v.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +383,6 @@ def _failed_testcases(results_xml: Path) -> list[str]:
 
 
 def _run_simulation(lanes: int) -> None:
-    import pytest
     try:                                    # cocotb >= 2.0
         from cocotb_tools.runner import get_runner
     except ImportError:                     # cocotb 1.8 / 1.9
@@ -392,6 +399,7 @@ def _run_simulation(lanes: int) -> None:
         build_dir=build_dir,
         always=True,
         timescale=("1ns", "1ps"),   # the RTL carries no `timescale directive
+        waves=WAVES,
     )
     try:
         runner.build(sources=sources, **build_kwargs)
@@ -405,6 +413,7 @@ def _run_simulation(lanes: int) -> None:
             test_dir=str(Path(__file__).resolve().parent),
             build_dir=build_dir,
             results_xml=str(build_dir / "results.xml"),
+            waves=WAVES,
         )
     except SystemExit as exc:               # cocotb 2.x exits on failing tests
         pytest.fail(f"simulation reported failures (exit code {exc.code}); "
@@ -413,12 +422,7 @@ def _run_simulation(lanes: int) -> None:
     assert not failed, f"failing cocotb tests: {failed}"
 
 
-def test_matvec_sim_default_lanes():
-    """Whole suite with the default 16 lanes (the 16x16 M0 configuration)."""
-    _run_simulation(16)
-
-
-def test_matvec_sim_few_lanes():
-    """Whole suite with 4 lanes: exercises the multi-cycle row and partial-chunk paths."""
-    _run_simulation(4)
-
+@pytest.mark.parametrize("lanes", LANES_LIST, ids=lambda n: f"lanes{n}")
+def test_matvec_sim(lanes):
+    """Whole suite for one LANES value (16 = the M0 target; 4 stresses multi-cycle rows)."""
+    _run_simulation(lanes)
