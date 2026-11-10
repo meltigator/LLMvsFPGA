@@ -110,6 +110,10 @@ No results yet. This section will only contain measured numbers.
 
 This is an engineering experiment on a hobbyist-class board. It makes no claim of competing with GPUs or production inference hardware; the goal is to measure where the bottlenecks really are.
 
+# Status
+
+Work in progress. M0 (16×16 bit-exact matrix-vector multiplication) is underway; the code in `rtl/` and `software/` consists of functional stubs that have not yet been verified. Contributions are welcome, especially regarding verification and DDR3 bandwidth estimation.
+
 ## License
 
 MIT License - see LICENSE for details.
