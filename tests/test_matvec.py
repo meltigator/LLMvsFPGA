@@ -105,6 +105,12 @@ class Bus:
             word = sum(int(b) << (8 * k) for k, b in enumerate(chunk))
             await self.write(base + i, word, (1 << len(chunk)) - 1)
 
+    async def write_bytes_individually(self, base: int, data: np.ndarray) -> None:
+        """One bus write per byte, using only a single byte enable (stresses write lanes)."""
+        raw = np.ascontiguousarray(data, dtype=np.int8).reshape(-1).view(np.uint8)
+        for i, b in enumerate(raw):
+            await self.write(base + (i & ~3), int(b) << (8 * (i & 3)), 1 << (i & 3))
+
     async def read_words(self, base: int, count: int) -> list[int]:
         return [await self.read(base + 4 * i) for i in range(count)]
 
@@ -136,10 +142,41 @@ async def setup(dut) -> tuple[Bus, int, int, int]:
     return bus, lanes, limits >> 16, limits & 0xFFFF
 
 
+def chunks_per_row(n: int, lanes: int) -> int:
+    return math.ceil(n / lanes)
+
+
 def expected_cycles(m: int, n: int, gs: int, lanes: int) -> int:
-    """Cycle model of the M0 engine: each group takes ceil(group/lanes) cycles."""
-    gs_eff = gs or n
-    return m * (n // gs_eff) * math.ceil(gs_eff / lanes)
+    """Cycle model of the M1 engine (docs/architecture.md, section 7).
+
+    One LANES-wide slice enters the pipeline every cycle (groups do not cost
+    extra cycles because they are LANES-aligned), plus the pipeline latency:
+    RAM read, multiply, log2(LANES) adder-tree levels, accumulate/Y write.
+    """
+    return m * chunks_per_row(n, lanes) + int(math.log2(lanes)) + 3
+
+
+PAD_VALUE = -128   # deliberately nasty: (-128) x (-128) is the largest possible product
+
+
+def pad_w(w: np.ndarray, lanes: int) -> np.ndarray:
+    """W window layout: every row padded to a multiple of LANES bytes.
+
+    The padding content is architecturally "don't care" (the engine masks it),
+    so the tests fill it with PAD_VALUE rather than zeros: a missing or wrong
+    mask would then change the result.
+    """
+    m, n = w.shape
+    padded = np.full((m, chunks_per_row(n, lanes) * lanes), PAD_VALUE, dtype=np.int8)
+    padded[:, :n] = w
+    return padded
+
+
+def pad_x(x: np.ndarray, lanes: int) -> np.ndarray:
+    """X bytes beyond N are also don't-care; fill them with PAD_VALUE."""
+    padded = np.full(chunks_per_row(len(x), lanes) * lanes, PAD_VALUE, dtype=np.int8)
+    padded[:len(x)] = x
+    return padded
 
 
 async def wait_done(bus: Bus, max_cycles: int, fail_on_err: bool = True) -> int:
@@ -162,15 +199,17 @@ def describe_mismatch(got: np.ndarray, exp: np.ndarray, label: str) -> str:
 
 
 async def run_job(bus: Bus, lanes: int, w: np.ndarray, x: np.ndarray, gs: int = 0,
-                  label: str = "", check_cycles: bool = True) -> np.ndarray:
+                  label: str = "", check_cycles: bool = True,
+                  bytewise: bool = False) -> np.ndarray:
     """Program dims, load data, START, wait, read Y, compare bit-exact."""
     m, n = w.shape
     groups = n // gs if gs else 1
     await bus.write(REG_DIM_M, m)
     await bus.write(REG_DIM_N, n)
     await bus.write(REG_GROUP, gs)
-    await bus.write_bytes(X_BASE, x)
-    await bus.write_bytes(W_BASE, w)
+    writer = bus.write_bytes_individually if bytewise else bus.write_bytes
+    await writer(X_BASE, pad_x(x, lanes))
+    await writer(W_BASE, pad_w(w, lanes))
     await bus.write(REG_CTRL, CTRL_START)
     await wait_done(bus, expected_cycles(m, n, gs, lanes) + 200)
 
@@ -207,7 +246,7 @@ async def tb_identity_and_reset_state(dut):
 async def tb_corner_cases_16x16(dut):
     """M0 target: 16x16 corner cases, whole-row and grouped."""
     bus, lanes, _, _ = await setup(dut)
-    for gs in (0, 4):
+    for gs in ((0, lanes) if lanes <= 16 else (0,)):
         for name, (w, x) in ref.corner_cases(16, 16).items():
             await run_job(bus, lanes, w, x, gs, label=f"corner '{name}'")
     dut._log.info("corner cases passed")
@@ -239,19 +278,46 @@ async def tb_shapes(dut):
 
 @cocotb.test()
 async def tb_grouped(dut):
-    """Per-group integer partial sums (llama2.c style), incl. group not multiple of LANES."""
-    bus, lanes, _, _ = await setup(dut)
-    cases = [(4, 64, 16), (4, 64, 32), (8, 128, 64), (3, 48, 12), (5, 30, 10),
-             (2, 16, 16), (2, 16, 1)]
+    """Per-group integer partial sums (llama2.c style). GROUP_SIZE: power of two >= LANES."""
+    bus, lanes, m_max, n_max = await setup(dut)
+    cases = []
+    for gs in (lanes, 2 * lanes, 4 * lanes):
+        n = 4 * gs
+        if n <= n_max:
+            cases.append((4, n, gs))
+    cases.append((3, 2 * lanes, 2 * lanes))        # one group per row
+    cases.append((2, 5 * lanes, lanes))            # N = 5 groups, odd count
     for m, n, gs in cases:
         w, x = ref.random_case(m, n, 3000 + m * 100 + gs)
         y = await run_job(bus, lanes, w, x, gs, label="grouped")
-        # consistency: group sums add up to the whole-row result
-        whole = ref.matvec(w, x, 0)
+        whole = ref.matvec(w, x, 0)                # group sums add up to the whole-row result
         assert np.array_equal(y.reshape(m, n // gs).sum(axis=1, dtype=np.int32), whole)
-    for name, (w, x) in ref.corner_cases(16, 32).items():
-        await run_job(bus, lanes, w, x, 8, label=f"grouped corner '{name}'")
+    for name, (w, x) in ref.corner_cases(16, 4 * lanes).items():
+        await run_job(bus, lanes, w, x, lanes, label=f"grouped corner '{name}'")
     dut._log.info("grouped passed")
+
+
+@cocotb.test()
+async def tb_write_lanes_bytewise(dut):
+    """W/X loaded one byte at a time with single byte enables (RAM byte lanes)."""
+    bus, lanes, _, _ = await setup(dut)
+    for m, n in ((3, 2 * lanes + 1), (2, lanes), (4, lanes - 1 if lanes > 1 else 1)):
+        w, x = ref.random_case(m, n, 6000 + m * 100 + n)
+        await run_job(bus, lanes, w, x, 0, label="bytewise load", bytewise=True)
+
+
+@cocotb.test()
+async def tb_pipeline_throughput(dut):
+    """One slice per cycle: CYCLES = M*ceil(N/LANES) + log2(LANES) + 3, for several shapes."""
+    bus, lanes, m_max, n_max = await setup(dut)
+    for m, n in ((1, 1), (1, lanes), (8, 4 * lanes), (16, 16), (5, 3 * lanes + 1)):
+        if m > m_max or n > n_max:
+            continue
+        w, x = ref.random_case(m, n, 7000 + m + n)
+        await run_job(bus, lanes, w, x, 0, label="throughput", check_cycles=True)
+        cyc = await bus.read(REG_CYCLES)
+        dut._log.info(f"M={m} N={n}: {cyc} cycles "
+                      f"(issue {m * chunks_per_row(n, lanes)} + latency {cyc - m * chunks_per_row(n, lanes)})")
 
 
 @cocotb.test()
@@ -269,6 +335,17 @@ async def tb_back_to_back_no_stale_state(dut):
     w2, x2 = ref.random_case(5, 20, 4242)       # smaller N: stale data beyond must be ignored
     await run_job(bus, lanes, w2, x2, 0, label="job B (smaller)")
     await run_job(bus, lanes, w2, x2, 0, label="job B repeated")
+
+    # START right after DONE (no data reload): nothing may still be in flight from the last job
+    for rep_i in range(3):
+        await bus.write(REG_CTRL, CTRL_START)
+        await wait_done(bus, 500)
+        await bus.write(REG_CTRL, CTRL_START)      # immediately again
+        await wait_done(bus, 500)
+        y = await bus.read_y(5)
+        exp2 = ref.matvec(w2, x2, 0)
+        assert np.array_equal(y, exp2), describe_mismatch(y, exp2, f"START right after DONE (round {rep_i})")
+        assert await bus.read(REG_CYCLES) == expected_cycles(5, 20, 0, lanes)
 
     # START clears DONE immediately
     await bus.write(REG_CTRL, CTRL_START)
@@ -297,9 +374,13 @@ async def tb_error_handling(dut):
     await expect_err(m_max + 1, 16, 0, "M > M_MAX")
     await expect_err(16, n_max + 1, 0, "N > N_MAX")
     await expect_err(16, 16, 32, "GROUP_SIZE > N")
-    await expect_err(16, 30, 8, "N not a multiple of GROUP_SIZE")
-    if m_max * n_max > 2048:
-        await expect_err(m_max, n_max, 1, "Y results exceed the 2048-word window")
+    await expect_err(16, 3 * lanes, 2 * lanes, "N not a multiple of GROUP_SIZE")
+    await expect_err(16, 2 * lanes, lanes // 2, "GROUP_SIZE < LANES")
+    await expect_err(16, 6 * lanes, 3 * lanes, "GROUP_SIZE not a power of two")
+    # N & (GS-1) == 0 here, so only the explicit power-of-two check rejects it
+    await expect_err(16, 4 * lanes, 3 * lanes, "GROUP_SIZE not a power of two (bit-mask test passes)")
+    if m_max * (n_max // lanes) > 2048:
+        await expect_err(m_max, n_max, lanes, "Y results exceed the 2048-word window")
 
     # ERR is cleared by the next valid START, and the engine works afterwards
     w, x = ref.random_case(16, 16, 77)
@@ -318,11 +399,12 @@ async def tb_busy_semantics(dut):
     await bus.write(REG_DIM_M, m)
     await bus.write(REG_DIM_N, n)
     await bus.write(REG_GROUP, 0)
-    await bus.write_bytes(X_BASE, x)
-    await bus.write_bytes(W_BASE, w)
+    await bus.write_bytes(X_BASE, pad_x(x, lanes))
+    await bus.write_bytes(W_BASE, pad_w(w, lanes))
     await bus.write(REG_CTRL, CTRL_START)
     st = await bus.read(REG_STATUS)
     assert st & ST_BUSY, "job should still be running"
+    assert await bus.read(X_BASE) == 0, "X window must read 0 while BUSY"
     await bus.write(REG_CTRL, CTRL_START)          # second START: ignored, raises ERR
     await bus.write(REG_DIM_N, 1)                  # ignored
     await bus.write(X_BASE, 0x7F7F7F7F)            # ignored
@@ -342,6 +424,16 @@ async def tb_busy_semantics(dut):
     assert (await bus.read(REG_STATUS)) & ST_BUSY
     await bus.write(REG_CTRL, CTRL_RESET)
     assert await bus.read(REG_STATUS) == 0, "SOFT_RESET must clear BUSY/DONE/ERR"
+    # --- START right after SOFT_RESET: in-flight pipeline data must not leak into the new job
+    await bus.write(REG_CTRL, CTRL_START)
+    await bus.wait_cycles(lanes // 4 + 4)          # pipeline partially filled
+    await bus.write(REG_CTRL, CTRL_RESET)
+    await bus.write(REG_CTRL, CTRL_START)          # same dims, X and W still loaded
+    await wait_done(bus, expected_cycles(m, n, 0, lanes) + 200)
+    y = await bus.read_y(m)
+    assert np.array_equal(y, exp), describe_mismatch(y, exp, "job started right after SOFT_RESET")
+    assert await bus.read(REG_CYCLES) == expected_cycles(m, n, 0, lanes)
+
     w2, x2 = ref.random_case(8, 24, 5)
     await run_job(bus, lanes, w2, x2, 0, label="after SOFT_RESET")
 
