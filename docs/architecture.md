@@ -113,32 +113,63 @@ llama2.c's INT8 path (`runq.c`) quantizes with **per-group float scales** (group
 
 Decision: the accelerator computes **integer partial sums per group** and returns them; scaling and the float accumulation stay on the ARM.
 
-- Register `GROUP_SIZE` selects GS; `0` means "whole row" (plain y = W·x, used in M0/M1).
+- Register `GROUP_SIZE` selects GS; `0` means "whole row" (plain y = W·x).
+- **Constraint (M1):** GS must be 0 or a **power of two ≥ `LANES`** that divides `DIM_N`. Groups are therefore `LANES`-aligned (no extra cycles) and the hardware needs no divider. This matches llama2.c, whose exporter halves GS until it divides the model dimension, so GS is always a power of two.
 - Output layout: `Y[row][group]`, int32, row-major.
 - This keeps the fabric integer-only and bit-exact testable.
 
-## 7. Microarchitecture (M0/M1)
+## 7. Microarchitecture (M1)
 
-Parameters: `LANES` (default 16), `M_MAX`, `N_MAX`.
+Parameters: `LANES` (power of two ≥ 4, default 16), `M_MAX`, `N_MAX`, `Y_WORDS`.
 
-Datapath per cycle: read `LANES` weights of the current row plus the matching `LANES` activations, multiply, reduce, accumulate.
+    X RAM ─┐                                                         ┌─► Y RAM
+           ├─► [mask] ─► [LANES × int8×int8] ─► [adder tree] ─► [acc]┘
+    W RAM ─┘   stage 1        stage 2          stages 3..2+log2 L   stage 3+log2 L
 
-    W RAM ──┐
-            ├─► [LANES × int8×int8] ─► [pipelined adder tree] ─► [accumulator] ─► Y RAM
-    X RAM ──┘
+One `LANES`-wide slice of the current row enters the pipeline **every cycle**; results leave `PIPE_LATENCY` cycles later.
 
-- Multipliers are mapped to DSP blocks (INT8 fits the 9×9 mode).
-- W RAM is organized with word width `LANES × 8` bits so one row-slice is read per cycle.
-- X is read with the same width and the same address sequence.
-- The accumulator is cleared at the start of each row (or group) and written out at its end.
+### 7.1 Memories (block RAM)
 
-Timing model:
+- **W RAM** and **X RAM** are `LANES` bytes wide, so a whole row-slice is fetched per cycle. Each is built from `LANES/4` banks of four byte-wide simple-dual-port RAMs (one write port from the bus, one synchronous read port), which lets the 32-bit bus write any byte with a byte enable while the core reads the full width. Written this way the RAMs are inferable as M10K.
+- **Y RAM** is one 32-bit simple-dual-port RAM (write: core, read: bus).
+- Bank mapping: bus word index `i` goes to bank `i mod (LANES/4)`, address `i / (LANES/4)`; bank `b` supplies lanes `4b … 4b+3`.
+- The read-during-write behavior is unspecified (`no_rw_check`): the architecture never reads a RAM while the bus writes it (bus writes are ignored while BUSY).
+- X has one read port shared by core and bus: **X reads from the bus return 0 while BUSY**.
 
-    cycles ≈ M × ceil(N / LANES) + PIPE_LATENCY        PIPE_LATENCY ≈ ceil(log2 LANES) + 3
+### 7.2 Layout contract
 
-For 16×16 with 16 lanes: 16 rows × 1 cycle + latency. The `CYCLES` register exposes the real count for benchmarking.
+- **W window:** row `r` starts at byte `r × CPR × LANES`, with `CPR = ceil(DIM_N / LANES)`. When `DIM_N` is a multiple of `LANES` this is plain packed row-major. Otherwise each row is padded up to a multiple of `LANES`.
+- Padding bytes in W, and X bytes beyond `DIM_N`, are **don't-care**: the last chunk of a row is masked. The tests fill them with −128 to prove it.
+- llama2.c matrices (dimensions multiples of the group size) need no padding in practice.
 
-FSM: `IDLE → RUN → DONE`. `START` from IDLE begins a run; `DONE` is sticky until the next `START`.
+### 7.3 Pipeline
+
+| Stage | What happens |
+|-------|--------------|
+| issue | address generator: row, chunk, group counter; emits `valid`, `last` (end of group), lane mask |
+| 1 | RAM output (registered inside the RAM) |
+| 2 | `LANES` signed 8×8 products, masked lanes forced to 0 (DSP 9×9) |
+| 3 … 2+log2 L | registered adder tree, one level per stage |
+| 3+log2 L | accumulate; on `last`, result goes to a register |
+| 4+log2 L | registered write into Y RAM; `DONE` set after the final write |
+
+`valid` and `last` travel alongside the data, so a new group can start the cycle after the previous one ends with no bubble.
+
+### 7.4 Timing model
+
+    CYCLES = DIM_M × ceil(DIM_N / LANES) + PIPE_LATENCY        PIPE_LATENCY = log2(LANES) + 3
+
+Groups cost nothing extra. `CYCLES` counts every cycle with `BUSY=1`. `tests/test_matvec.py` checks this formula on every job, so any change to the engine's timing is a deliberate, visible change.
+
+Peak throughput is `LANES` MAC/cycle. As §5 explains, that rate is only useful if the weights arrive that fast: with on-chip weights (M1/M2) it is, with DDR3 streaming (M3) it is bounded by the measured bandwidth.
+
+FSM: `IDLE → BUSY → DONE`. `START` from IDLE begins a run; `DONE` is sticky until the next `START` or `SOFT_RESET`.
+
+### 7.5 Synthesis notes
+
+- No variable divider: `GROUP_SIZE` is restricted to powers of two, `DIM_N / GROUP_SIZE` becomes a shift.
+- One combinational multiply remains (`DIM_M × groups`, 16×16 bit), evaluated only at START for the Y-capacity check. It is a candidate multi-cycle path if timing is tight.
+- Open items for Quartus: confirm M10K inference, confirm the 8×8 products land in DSP blocks (`multstyle`), `f_max`, and the resource report.
 
 ## 8. Register map (LW H2F slave)
 
@@ -147,18 +178,38 @@ Offsets from the slave base address. 32-bit registers, little-endian.
 | Offset | Name | Access | Description |
 |--------|------|--------|-------------|
 | `0x0000` | `ID` | RO | `0x4C4C4650` ("LLFP") |
-| `0x0004` | `VERSION` | RO | Design version |
+| `0x0004` | `VERSION` | RO | Design version (`2` = M1) |
 | `0x0008` | `CTRL` | RW | bit0 `START` (self-clearing), bit1 `SOFT_RESET` |
 | `0x000C` | `STATUS` | RO | bit0 `BUSY`, bit1 `DONE`, bit2 `ERR` |
 | `0x0010` | `DIM_M` | RW | Number of rows |
 | `0x0014` | `DIM_N` | RW | Row length |
-| `0x0018` | `GROUP_SIZE` | RW | 0 = whole row |
-| `0x001C` | `CYCLES` | RO | Cycles of the last run |
-| `0x1000` | `X` window | RW | int8, 4 per word, up to `N_MAX` bytes |
-| `0x2000` | `Y` window | RO | int32 results |
-| `0x10000` | `W` window | WO | int8, row-major, up to 64 KB (M0–M2) |
+| `0x0018` | `GROUP_SIZE` | RW | 0 = whole row, else a power of two ≥ `LANES` dividing `DIM_N` |
+| `0x001C` | `CYCLES` | RO | Engine cycles of the last run |
+| `0x0020` | `CAPS` | RO | bits [7:0] = `LANES` |
+| `0x0024` | `LIMITS` | RO | bits [31:16] = `M_MAX`, bits [15:0] = `N_MAX` |
+| `0x1000` | `X` window | RW | int8, 4 per word, little-endian, up to `N_MAX` bytes (4 KB). Reads return 0 while `BUSY` |
+| `0x2000` | `Y` window | RO | int32 results, up to 2048 words (8 KB) |
+| `0x10000` | `W` window | WO | int8, row-major, each row padded to a multiple of `LANES` (§7.2), up to 64 KB (M0–M2) |
 
-`ERR` is raised if dimensions exceed `M_MAX`/`N_MAX` or `START` arrives while `BUSY`.
+Software discovers `LANES`, `M_MAX` and `N_MAX` from `CAPS`/`LIMITS` instead of hard-coding them, so the same driver and the same tests run against different builds.
+
+Reset defaults: `DIM_M = 16`, `DIM_N = 16`, `GROUP_SIZE = 0` (the M0 target configuration), `STATUS = 0`.
+
+The W/X layout and the `GROUP_SIZE` constraint changed between M0 and M1 (§6.2, §7.2). `VERSION` lets a driver tell the builds apart.
+
+### 8.1 Behavior rules
+
+- **START** (`CTRL` bit0) is evaluated when written. If the configuration is valid and the engine is idle: `BUSY=1`, `DONE=0`, `ERR=0`, `CYCLES=0`.
+- **Invalid configuration** on START (nothing starts; `STATUS` reads exactly `ERR`):
+  `DIM_M = 0` or `> M_MAX`; `DIM_N = 0` or `> N_MAX`; `GROUP_SIZE` nonzero and not a power of two, `< LANES`, `> DIM_N`, or not dividing `DIM_N`; or `DIM_M × groups_per_row` larger than the Y window (2048 words).
+- **START while BUSY** is ignored (the running job is not restarted) and raises `ERR`.
+- **While BUSY**, writes to `DIM_M`, `DIM_N`, `GROUP_SIZE` and to the X/W windows are ignored, so a running job cannot be corrupted. Only `CTRL` is accepted.
+- **SOFT_RESET** (`CTRL` bit1) aborts a running job, flushes the pipeline, and clears `BUSY`, `DONE` and `ERR`. It takes priority over START if both bits are set. A START may follow in the very next cycle.
+- A START may also be issued in the cycle right after `DONE` is seen: nothing is left in flight.
+- **DONE** is sticky until the next START or SOFT_RESET. **ERR** is cleared by SOFT_RESET or by the next accepted START.
+- Reads of the W window return 0; writes to the Y window are ignored. Y is valid once `DONE` is set.
+- The X and W windows honor the Avalon byte enables.
+- Avalon-MM slave: word addressing (byte offset >> 2), fixed read latency of 1 cycle, no `waitrequest`.
 
 M3 adds (no existing register changes): `W_BASE_ADDR`, `W_STRIDE`, and a `SRC` bit selecting on-chip vs DDR3 weights.
 
@@ -167,17 +218,24 @@ M3 adds (no existing register changes): `W_BASE_ADDR`, `W_STRIDE`, and a `SRC` b
 Three levels, same test vectors at each level:
 
 1. **Golden model** (`software/reference.py`): pure Python/NumPy, `int8` inputs, `int32` accumulation. Includes the group-wise variant.
-2. **RTL simulation** (`sim/`, `tests/test_matvec.py`): cocotb with Verilator or Icarus, comparing RTL output with the golden model.
+2. **RTL simulation** (`sim/run_sim.py`, `tests/test_matvec.py`): cocotb with Icarus Verilog, driving the Avalon register map and comparing RTL output with the golden model, for `LANES` = 4, 8, 16, 32.
 3. **On board** (`hps/`): the same vectors driven from the ARM; mismatches are reported with row/column and expected vs obtained values.
 
 Test vector classes:
 
 - Random matrices with fixed seeds (reproducible).
 - Corner cases: all `-128`, all `127`, `-128 × -128` (maximum magnitude), zeros, identity, alternating signs.
-- Non-multiples of `LANES` (padding behavior).
-- Group sizes: `0`, 16, 64.
+- Non-multiples of `LANES`, with the padding filled with −128 (the mask must hide it).
+- Group sizes: `0` and powers of two ≥ `LANES`; invalid sizes must raise `ERR`.
+- Byte-at-a-time loading (single byte enables) to exercise every RAM byte lane.
+- Control corner cases: START while BUSY, writes while BUSY, SOFT_RESET mid-job followed by an immediate START, START right after DONE.
+- Timing: `CYCLES` must equal the formula of §7.4 on every job.
 
 Pass criterion: **bit-exact** equality. No tolerance anywhere in the integer path.
+
+**Testing the tests.** The suite was checked by mutation: 18 deliberate RTL bugs (unsigned weights, missing lane mask, wrong tree wiring, bank mapping, byte enables, pipeline flush, validation rules, extra row issued, ...) were injected one at a time and every one is caught. Two rounds of this found real gaps in the first version of the tests (zero padding hiding a missing mask; no START immediately after DONE), which is why those cases exist.
+
+Static check: Yosys sees all memories as memories (W and X: `4 × LANES/4` byte RAMs each, Y: one 32-bit RAM), each with one write port and one synchronous read port, and emits no "replaced by registers" warning.
 
 ## 10. Benchmark methodology
 
@@ -194,7 +252,9 @@ Pass criterion: **bit-exact** equality. No tolerance anywhere in the integer pat
 | Cortex-A9 + NEON is already near the memory wall | Report honestly; the ratio is the result |
 | Non-matvec operations dominate after offload | Profile in M4 before optimizing |
 | M10K capacity limits on-chip weights | Tiling in M1, DDR3 streaming in M3 |
-| Quartus Lite limited SystemVerilog support | Restrict to a conservative subset or use Verilog-2001 |
+| Quartus Lite limited SystemVerilog support | The RTL uses Verilog-2001 constructs plus `$clog2`; verify in Quartus |
+| M1 RTL has been simulated and checked with Yosys, never with Quartus | First on-board step: synthesize with Quartus, read the resource and timing reports before anything else |
+| Yosys/ABC crashed once during a full Cyclone V mapping, so logic-cell counts are unreliable | Use Quartus reports; rely on Yosys only for memory inference and DSP counts |
 | Timing closure below target `f_clk` | Pipeline the adder tree, reduce `LANES` |
 
 ## 12. References
@@ -205,3 +265,4 @@ Pass criterion: **bit-exact** equality. No tolerance anywhere in the integer pat
 - A. Karpathy, llama2.c (`run.c`, `runq.c`)
 - RCoeurjoly, LLM2FPGA (related work, compiler-based approach)
 - S. Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009)
+  
